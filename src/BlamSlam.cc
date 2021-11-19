@@ -34,16 +34,21 @@
  * Authors: Erik Nelson            ( eanelson@eecs.berkeley.edu )
  */
 
+#include <ros/ros.h>
 #include <blam_slam/BlamSlam.h>
 #include <geometry_utils/Transform3.h>
 #include <parameter_utils/ParameterUtils.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl_ros/point_cloud.h>
+#include <pcl/common/transforms.h>
+
+#define VERBOSE false
 
 namespace pu = parameter_utils;
 namespace gu = geometry_utils;
 
 BlamSlam::BlamSlam()
-    : estimate_update_rate_(0.0), visualization_update_rate_(0.0) {}
+    : estimate_update_rate_(0.0), visualization_update_rate_(0.0), process_count_(0) {}
 
 BlamSlam::~BlamSlam() {}
 
@@ -96,6 +101,21 @@ bool BlamSlam::LoadParameters(const ros::NodeHandle& n) {
   // Load frame ids.
   if (!pu::Get("frame_id/fixed", fixed_frame_id_)) return false;
   if (!pu::Get("frame_id/base", base_frame_id_)) return false;
+
+  // Load pre-transform position.
+  double pre_trans_x = 0.0, pre_trans_y = 0.0, pre_trans_z = 0.0;
+  double pre_trans_roll = 0.0, pre_trans_pitch = 0.0, pre_trans_yaw = 0.0;
+  if (!pu::Get("pre_trans/position/x", pre_trans_x)) return false;
+  if (!pu::Get("pre_trans/position/y", pre_trans_y)) return false;
+  if (!pu::Get("pre_trans/position/z", pre_trans_z)) return false;
+  if (!pu::Get("pre_trans/orientation/roll", pre_trans_roll)) return false;
+  if (!pu::Get("pre_trans/orientation/pitch", pre_trans_pitch)) return false;
+  if (!pu::Get("pre_trans/orientation/yaw", pre_trans_yaw)) return false;
+
+  gu::Transform3 pre_trans;
+  pre_trans.translation = gu::Vec3(pre_trans_x, pre_trans_y, pre_trans_z);
+  pre_trans.rotation = gu::Rot3(pre_trans_roll, pre_trans_pitch, pre_trans_yaw);
+  pre_transform_ = pre_trans;
 
   return true;
 }
@@ -161,6 +181,8 @@ void BlamSlam::EstimateTimerCallback(const ros::TimerEvent& ev) {
         const MeasurementSynchronizer::Message<PointCloud>::ConstPtr& m =
             synchronizer_.GetPCLPointCloudMessage(index);
 
+        process_count_++;
+        ROS_INFO_STREAM(name_<< " ProcessPointCloudMessage " <<process_count_);
         ProcessPointCloudMessage(m->msg);
         break;
       }
@@ -183,9 +205,14 @@ void BlamSlam::VisualizationTimerCallback(const ros::TimerEvent& ev) {
 }
 
 void BlamSlam::ProcessPointCloudMessage(const PointCloud::ConstPtr& msg) {
+  if(VERBOSE) ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: START");
+  PointCloud::Ptr msg__pre_transformed(new PointCloud);
+  PreTransformPoints(*msg,msg__pre_transformed.get());
   // Filter the incoming point cloud message.
   PointCloud::Ptr msg_filtered(new PointCloud);
+
   filter_.Filter(msg, msg_filtered);
+  if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: filtered "<<msg_filtered->size()<<" from "<<msg->size() );
 
   // Update odometry by performing ICP.
   if (!odometry_.UpdateEstimate(*msg_filtered)) {
@@ -193,8 +220,10 @@ void BlamSlam::ProcessPointCloudMessage(const PointCloud::ConstPtr& msg) {
     PointCloud::Ptr unused(new PointCloud);
     mapper_.InsertPoints(msg_filtered, unused.get());
     loop_closure_.AddKeyScanPair(0, msg);
+    if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: odometry FIRST" );
     return;
   }
+  if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: odometry" );
 
   // Containers.
   PointCloud::Ptr msg_transformed(new PointCloud);
@@ -206,12 +235,15 @@ void BlamSlam::ProcessPointCloudMessage(const PointCloud::ConstPtr& msg) {
   localization_.MotionUpdate(odometry_.GetIncrementalEstimate());
   localization_.TransformPointsToFixedFrame(*msg_filtered,
                                             msg_transformed.get());
+  if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: localization1" );
 
   // Get approximate nearest neighbors from the map.
   mapper_.ApproxNearestNeighbors(*msg_transformed, msg_neighbors.get());
+  if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: map1" );
 
   // Transform those nearest neighbors back into sensor frame to perform ICP.
   localization_.TransformPointsToSensorFrame(*msg_neighbors, msg_neighbors.get());
+  if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: localization2" );
 
   // Localize to the map. Localization will output a pointcloud aligned in the
   // sensor frame.
@@ -230,6 +262,7 @@ void BlamSlam::ProcessPointCloudMessage(const PointCloud::ConstPtr& msg) {
 
     // Also reset the robot's estimated position.
     localization_.SetIntegratedEstimate(loop_closure_.GetLastPose());
+    if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: loop_closure_" );
   } else {
     // No new loop closures - but was there a new key frame? If so, add new
     // points to the map.
@@ -238,6 +271,7 @@ void BlamSlam::ProcessPointCloudMessage(const PointCloud::ConstPtr& msg) {
       localization_.TransformPointsToFixedFrame(*msg, msg_fixed.get());
       PointCloud::Ptr unused(new PointCloud);
       mapper_.InsertPoints(msg_fixed, unused.get());
+      if(VERBOSE)ROS_INFO_STREAM("BlamSlam::ProcessPointCloudMessage:: non_loop_closure" );
     }
   }
 
@@ -288,5 +322,20 @@ bool BlamSlam::HandleLoopClosures(const PointCloud::ConstPtr& scan,
     ROS_INFO("%s: Closed loop between poses %u and %u.", name_.c_str(),
              pose_key, closure_key);
   }
+  return true;
+}
+
+bool BlamSlam::PreTransformPoints(const PointCloud& points, PointCloud* points_transformed) const
+{
+
+  const Eigen::Matrix<double, 3, 3> R = pre_transform_.rotation.Eigen();
+  const Eigen::Matrix<double, 3, 1> T = pre_transform_.translation.Eigen();
+
+  Eigen::Matrix4d tf;
+  tf.block(0, 0, 3, 3) = R;
+  tf.block(0, 3, 3, 1) = T;
+
+  pcl::transformPointCloud(points, *points_transformed, tf);
+
   return true;
 }

@@ -82,11 +82,13 @@ class BlamSlamOffline {
       return false;
     }
 
+    ROS_INFO_STREAM("STARTING LoadBagfile");
     if (!LoadBagfile()) {
       ROS_ERROR("%s: Failed to load bag file.", name_.c_str());
       return false;
     }
 
+    ROS_INFO_STREAM("STARTING ProcessBagfile");
     if (!ProcessBagfile()) {
       ROS_ERROR("%s: Failed to process bag file.", name_.c_str());
       return false;
@@ -209,6 +211,7 @@ class BlamSlamOffline {
               BlamSlam::PointCloud>::ConstPtr& m =
               synchronizer_.GetPCLPointCloudMessage(index);
 
+           ROS_INFO_STREAM("Processing "<< synchronizer_.GetPendingIndex()<<" out of Total "<< synchronizer_.GetMessageCount());
           slam_.ProcessPointCloudMessage(m->msg);
           scan_pub_.publish(m->msg);
 
